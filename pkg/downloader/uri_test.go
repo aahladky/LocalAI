@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strconv"
+	"strings"
 
 	. "github.com/mudler/LocalAI/pkg/downloader"
 	. "github.com/onsi/ginkgo/v2"
@@ -221,24 +222,34 @@ var _ = Describe("Download Test", func() {
 			var respData []byte
 			rangeString := r.Header.Get("Range")
 			if rangeString != "" {
-				startPos, endPos, err = extractRangeHeader(rangeString)
-				if err != nil {
-					if _, ok := err.(*RangeHeaderError); ok {
+				if !supportsRangeHeader {
+					// Server doesn't support ranges — return full response.
+					rangeString = ""
+				} else {
+					startPos, endPos, err = extractRangeHeader(rangeString)
+					if err != nil {
+						if _, ok := err.(*RangeHeaderError); ok {
+							w.WriteHeader(http.StatusBadRequest)
+							return
+						}
+						Expect(err).ToNot(HaveOccurred())
+					}
+					if endPos == -1 {
+						endPos = len(mockData)
+					}
+					if startPos < 0 || startPos >= len(mockData) || endPos < 0 || endPos > len(mockData) || startPos > endPos {
 						w.WriteHeader(http.StatusBadRequest)
 						return
 					}
-					Expect(err).ToNot(HaveOccurred())
-				}
-				if endPos == -1 {
-					endPos = len(mockData)
-				}
-				if startPos < 0 || startPos >= len(mockData) || endPos < 0 || endPos > len(mockData) || startPos > endPos {
-					w.WriteHeader(http.StatusBadRequest)
-					return
 				}
 			}
 			respData = mockData[startPos:endPos]
-			w.WriteHeader(http.StatusOK)
+			if rangeString != "" && supportsRangeHeader {
+				w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", startPos, endPos-1, len(mockData)))
+				w.WriteHeader(http.StatusPartialContent)
+			} else {
+				w.WriteHeader(http.StatusOK)
+			}
 			w.Write(respData)
 		}))
 		mockServer.EnableHTTP2 = true
@@ -343,5 +354,146 @@ var _ = Describe("Download Test", func() {
 	AfterEach(func() {
 		os.Remove(filePath) // cleanup, also checks existence of filePath`
 		os.Remove(filePath + ".partial")
+	})
+})
+
+var _ = Describe("Parallel download", func() {
+	var filePath string
+	var savedThreshold int64
+
+	// Range-aware mock server that serves data in chunks.
+	rangeMockServer := func(data []byte) *httptest.Server {
+		return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Method == "HEAD" {
+				w.Header().Set("Accept-Ranges", "bytes")
+				w.WriteHeader(http.StatusOK)
+				return
+			}
+			start := 0
+			end := len(data) - 1
+			if rh := r.Header.Get("Range"); rh != "" {
+				parsed := strings.TrimPrefix(rh, "bytes=")
+				parts := strings.SplitN(parsed, "-", 2)
+				if len(parts) == 2 {
+					fmt.Sscanf(parts[0], "%d", &start)
+					if parts[1] != "" {
+						fmt.Sscanf(parts[1], "%d", &end)
+					}
+				}
+			}
+			if start >= len(data) || end >= len(data) {
+				w.WriteHeader(http.StatusRequestedRangeNotSatisfiable)
+				return
+			}
+			if r.Header.Get("Range") != "" {
+				w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, len(data)))
+				w.Header().Set("Content-Length", strconv.Itoa(end-start+1))
+				w.WriteHeader(http.StatusPartialContent)
+			} else {
+				w.Header().Set("Content-Length", strconv.Itoa(len(data)))
+				w.WriteHeader(http.StatusOK)
+			}
+			w.Write(data[start : end+1])
+		}))
+	}
+
+	BeforeEach(func() {
+		dir, err := os.Getwd()
+		Expect(err).ToNot(HaveOccurred())
+		filePath = dir + "/parallel_model"
+		savedThreshold = GetParallelSizeThreshold()
+		// Lower threshold so tests don't need 50MB of data.
+		SetParallelSizeThreshold(1000)
+	})
+
+	AfterEach(func() {
+		SetParallelSizeThreshold(savedThreshold)
+		os.Remove(filePath)
+		os.Remove(filePath + ".partial")
+		os.Remove(filePath + ".partial.meta")
+	})
+
+	It("uses parallel path for range-capable server above threshold", func() {
+		data := make([]byte, 5000)
+		_, err := rand.Read(data)
+		Expect(err).ToNot(HaveOccurred())
+		sum := sha256.Sum256(data)
+		sha := fmt.Sprintf("%x", sum)
+
+		server := rangeMockServer(data)
+		defer server.Close()
+
+		uri := URI(server.URL)
+		err = uri.DownloadFile(filePath, sha, 1, 1, func(s1, s2, s3 string, f float64) {})
+		Expect(err).ToNot(HaveOccurred())
+
+		result, rerr := os.ReadFile(filePath)
+		Expect(rerr).ToNot(HaveOccurred())
+		Expect(result).To(Equal(data))
+	})
+
+	It("falls back to single-stream when parallel fails", func() {
+		data := make([]byte, 5000)
+		rand.Read(data)
+
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			rh := r.Header.Get("Range")
+			if rh != "" && rh != "bytes=0-0" {
+				// Reject non-probe range requests to force parallel failure.
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			}
+			if rh == "bytes=0-0" {
+				w.Header().Set("Content-Range", fmt.Sprintf("bytes 0-0/%d", len(data)))
+				w.WriteHeader(http.StatusPartialContent)
+				w.Write(data[0:1])
+				return
+			}
+			w.WriteHeader(http.StatusOK)
+			w.Write(data)
+		}))
+		defer server.Close()
+
+		uri := URI(server.URL)
+		// Disable retries so the fallback test stays fast.
+		err := uri.DownloadFile(filePath, "", 1, 1, func(s1, s2, s3 string, f float64) {}, WithMaxRetries(0))
+		Expect(err).ToNot(HaveOccurred())
+
+		result, rerr := os.ReadFile(filePath)
+		Expect(rerr).ToNot(HaveOccurred())
+		Expect(len(result)).To(Equal(len(data)))
+	})
+
+	It("verifies SHA after parallel download", func() {
+		data := make([]byte, 5000)
+		rand.Read(data)
+		wrongSHA := "0000000000000000000000000000000000000000000000000000000000000000"
+
+		server := rangeMockServer(data)
+		defer server.Close()
+
+		uri := URI(server.URL)
+		err := uri.DownloadFile(filePath, wrongSHA, 1, 1, func(s1, s2, s3 string, f float64) {})
+		Expect(err).To(HaveOccurred())
+		Expect(err.Error()).To(ContainSubstring("SHA"))
+
+		_, statErr := os.Stat(filePath)
+		Expect(os.IsNotExist(statErr)).To(BeTrue())
+	})
+
+	It("does not trigger parallel for small files below threshold", func() {
+		data := make([]byte, 500)
+		rand.Read(data)
+
+		server := rangeMockServer(data)
+		defer server.Close()
+
+		uri := URI(server.URL)
+		err := uri.DownloadFile(filePath, "", 1, 1, func(s1, s2, s3 string, f float64) {})
+		Expect(err).ToNot(HaveOccurred())
+
+		result, rerr := os.ReadFile(filePath)
+		Expect(rerr).ToNot(HaveOccurred())
+		Expect(len(result)).To(Equal(len(data)))
 	})
 })

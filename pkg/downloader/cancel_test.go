@@ -32,22 +32,39 @@ var _ = Describe("Download cancellation", func() {
 				return
 			}
 			start := 0
+			end := len(data) - 1 // inclusive
 			if rh := r.Header.Get("Range"); rh != "" {
-				_, _ = fmt.Sscanf(strings.TrimPrefix(rh, "bytes="), "%d-", &start)
+				parsed := strings.TrimPrefix(rh, "bytes=")
+				parts := strings.SplitN(parsed, "-", 2)
+				if len(parts) == 2 {
+					_, _ = fmt.Sscanf(parts[0], "%d", &start)
+					if parts[1] != "" {
+						_, _ = fmt.Sscanf(parts[1], "%d", &end)
+					}
+				}
 			}
-			w.Header().Set("Content-Length", strconv.Itoa(len(data)-start))
-			if start > 0 {
+			if start >= len(data) {
+				w.WriteHeader(http.StatusRequestedRangeNotSatisfiable)
+				return
+			}
+			if end >= len(data) {
+				end = len(data) - 1
+			}
+			if r.Header.Get("Range") != "" {
+				w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, len(data)))
+				w.Header().Set("Content-Length", strconv.Itoa(end-start+1))
 				w.WriteHeader(http.StatusPartialContent)
 			} else {
+				w.Header().Set("Content-Length", strconv.Itoa(len(data)))
 				w.WriteHeader(http.StatusOK)
 			}
 			f, _ := w.(http.Flusher)
-			for i := start; i < len(data); i += 256 {
-				end := i + 256
-				if end > len(data) {
-					end = len(data)
+			for i := start; i <= end; i += 256 {
+				chunkEnd := i + 256
+				if chunkEnd > end+1 {
+					chunkEnd = end + 1
 				}
-				if _, err := w.Write(data[i:end]); err != nil {
+				if _, err := w.Write(data[i:chunkEnd]); err != nil {
 					return
 				}
 				if f != nil {

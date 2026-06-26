@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/google/go-containerregistry/pkg/v1/tarball"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
@@ -53,7 +54,10 @@ type ImageVerifier interface {
 }
 
 type downloadOptions struct {
-	verifier ImageVerifier
+	verifier     ImageVerifier
+	concurrency  int           // 0 = use default/env; 1 = force single-stream
+	maxRetries   int           // -1 = use default/env; 0 = disable retry; >0 = explicit N
+	retryBackoff time.Duration // 0 = use default/env; >0 = explicit
 }
 
 // DownloadOption configures DownloadFileWithContext / DownloadFile.
@@ -70,8 +74,31 @@ func WithImageVerifier(v ImageVerifier) DownloadOption {
 	return func(o *downloadOptions) { o.verifier = v }
 }
 
+// WithConcurrency overrides the number of concurrent chunk download
+// goroutines for parallel downloads. A value of 1 forces single-stream
+// behavior. A value of 0 (the default) uses the
+// LOCALAI_DOWNLOAD_CONCURRENCY env var, falling back to 8.
+func WithConcurrency(n int) DownloadOption {
+	return func(o *downloadOptions) { o.concurrency = n }
+}
+
+// WithMaxRetries sets the number of per-chunk retry attempts for parallel
+// downloads. A value of 0 disables retry entirely. A value of -1 (the
+// default) uses the LOCALAI_DOWNLOAD_RETRIES env var, falling back to 3.
+func WithMaxRetries(n int) DownloadOption {
+	return func(o *downloadOptions) { o.maxRetries = n }
+}
+
+// WithRetryBackoff sets the base backoff duration between chunk retry
+// attempts. Backoff is exponential (base * 2^attempt) with jitter.
+// A value of 0 uses the LOCALAI_DOWNLOAD_RETRY_BACKOFF env var,
+// falling back to 500ms.
+func WithRetryBackoff(d time.Duration) DownloadOption {
+	return func(o *downloadOptions) { o.retryBackoff = d }
+}
+
 func applyDownloadOptions(opts []DownloadOption) downloadOptions {
-	var o downloadOptions
+	o := downloadOptions{maxRetries: -1} // -1 = unset, use env/default
 	for _, fn := range opts {
 		fn(&o)
 	}
@@ -367,6 +394,81 @@ func calculateHashForPartialFile(file *os.File) (hash.Hash, error) {
 // deadline so large downloads are not truncated.
 var downloadClient = httpclient.New(httpclient.WithFollowRedirects())
 
+// rangeProbeResult holds the outcome of a Range: bytes=0-0 probe.
+type rangeProbeResult struct {
+	supportsRanges bool
+	totalSize      int64 // total file size from Content-Range; 0 if unknown
+}
+
+// probeRangeSupport issues Range: bytes=0-0 to the resolved URL and returns
+// whether the server supports range requests along with the total file size.
+// This is more reliable than HEAD + Accept-Ranges: some CDNs omit the header
+// even when they support ranges, and some advertise it but reject actual range
+// requests.
+//
+// A server that returns 200 OK (instead of 206 Partial Content) in response
+// to a Range request is treated as "no range support" — it ignored the header.
+// On any error, the probe returns supportsRanges=false so the caller falls
+// through to single-stream (a server that's wrong about its own range support
+// is the main failure mode to design around).
+func (uri URI) probeRangeSupport() rangeProbeResult {
+	url := uri.ResolveURL()
+
+	// Use a short-lived context so the probe doesn't block forever on a
+	// stalled server. 5s is generous for a 1-byte response even with redirects.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+	if err != nil {
+		xlog.Debug("[downloader] range probe request creation failed", "url", url, "error", err)
+		return rangeProbeResult{}
+	}
+	req.Header.Set("Range", "bytes=0-0")
+
+	resp, err := downloadClient.Do(req)
+	if err != nil {
+		xlog.Debug("[downloader] range probe request failed", "url", url, "error", err)
+		return rangeProbeResult{}
+	}
+	defer resp.Body.Close()
+
+	// Confirm the body is reachable by reading exactly one byte, then stop.
+	// A server that ignores the Range header might stream the full file;
+	// draining it could block indefinitely, so we intentionally do not read
+	// past the first byte.
+	_, _ = io.CopyN(io.Discard, resp.Body, 1)
+
+	if resp.StatusCode != http.StatusPartialContent {
+		// 200 OK means the server ignored the Range header.
+		xlog.Debug("[downloader] range probe returned non-206", "url", url, "status", resp.StatusCode)
+		return rangeProbeResult{}
+	}
+
+	cr := resp.Header.Get("Content-Range")
+	if cr == "" {
+		xlog.Debug("[downloader] range probe missing Content-Range", "url", url)
+		return rangeProbeResult{}
+	}
+	// Content-Range: bytes 0-0/TOTAL
+	parts := strings.Split(cr, "/")
+	if len(parts) != 2 {
+		xlog.Debug("[downloader] range probe malformed Content-Range", "url", url, "contentRange", cr)
+		return rangeProbeResult{}
+	}
+	total, err := strconv.ParseInt(strings.TrimSpace(parts[1]), 10, 64)
+	if err != nil || total <= 0 {
+		xlog.Debug("[downloader] range probe bad total size", "url", url, "contentRange", cr, "error", err)
+		return rangeProbeResult{}
+	}
+
+	return rangeProbeResult{supportsRanges: true, totalSize: total}
+}
+
+// checkSeverSupportsRangeHeader is the legacy probe (HEAD + Accept-Ranges).
+// Deprecated: use probeRangeSupport() which is more reliable across CDNs.
+// Kept temporarily for backward compatibility during the parallel-download
+// refactor; will be removed once all callers migrate.
 func (uri URI) checkSeverSupportsRangeHeader() (bool, error) {
 	url := uri.ResolveURL()
 	resp, err := downloadClient.Head(url)
@@ -563,27 +665,88 @@ func (uri URI) DownloadFileWithContext(ctx context.Context, filePath, sha string
 
 	xlog.Info("Downloading", "url", url)
 
+	// Probe for range support once. This is used for resume logic and will
+	// later drive the parallel-vs-single-stream decision. The probe is
+	// non-fatal: on any error we fall through to single-stream.
+	var probe rangeProbeResult
+	if URI(url).LooksLikeHTTPURL() {
+		probe = uri.probeRangeSupport()
+	}
+
+	// Parallel download path: if the server supports ranges and the file
+	// is large enough, use concurrent chunked downloads for throughput.
+	concurrency := resolveConcurrency(dopts.concurrency)
+	maxRetries := resolveMaxRetries(dopts.maxRetries)
+	retryBackoff := resolveRetryBackoff(dopts.retryBackoff)
+	if probe.supportsRanges && probe.totalSize >= parallelSizeThreshold && URI(url).LooksLikeHTTPURL() && concurrency > 1 {
+		xlog.Info("[downloader] Using parallel download", "url", url, "size", formatBytes(probe.totalSize), "concurrency", concurrency, "maxRetries", maxRetries)
+		err := downloadParallel(ctx, url, filePath, probe.totalSize, concurrency, maxRetries, retryBackoff, downloadStatus, fileN, total)
+		if err != nil {
+			if ctx.Err() != nil {
+				if errors.Is(context.Cause(ctx), ErrUserCancelled) {
+					_ = removePartialFile(filePath + ".partial")
+					_ = os.Remove(filePath + parallelMetaFileSuffix)
+				}
+				return ctx.Err()
+			}
+			// Parallel failed — fall through to single-stream.
+			xlog.Warn("[downloader] Parallel download failed, falling back to single-stream", "error", err)
+			_ = removePartialFile(filePath + ".partial")
+			_ = os.Remove(filePath + parallelMetaFileSuffix)
+		} else {
+			// Parallel succeeded. Verify SHA if provided.
+			if sha != "" {
+				calculatedSHA, cerr := CalculateSHA(filePath)
+				if cerr != nil {
+					return fmt.Errorf("failed to calculate SHA for file %q: %v", filePath, cerr)
+				}
+				if calculatedSHA != sha {
+					_ = os.Remove(filePath)
+					return fmt.Errorf("SHA mismatch for file %q ( calculated: %s != metadata: %s )", filePath, calculatedSHA, sha)
+				}
+			} else {
+				xlog.Warn("downloading without integrity check — supplied SHA is empty",
+					"file", filePath, "url", url)
+			}
+			xlog.Info("File downloaded and verified", "file", filePath)
+			if utils.IsArchive(filePath) {
+				basePath := filepath.Dir(filePath)
+				xlog.Info("File is an archive, uncompressing", "file", filePath, "basePath", basePath)
+				if err := utils.ExtractArchive(filePath, basePath); err != nil {
+					xlog.Debug("Failed decompressing", "file", filePath, "error", err)
+					return err
+				}
+			}
+			return nil
+		}
+	}
+
 	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
 		return fmt.Errorf("failed to create request for %q: %v", filePath, err)
 	}
 
-	// save partial download to dedicated file
+	// Resume from .partial if one exists and the server supports ranges.
 	tmpFilePath := filePath + ".partial"
+	metaPath := filePath + parallelMetaFileSuffix
+	if _, err := os.Stat(metaPath); err == nil {
+		// A stale .partial.meta means the previous attempt used parallel
+		// downloads. If we take the single-stream path now (concurrency=1,
+		// probe failed, or fallback), the .partial file may contain holes
+		// from out-of-order chunk writes. Discard it rather than risk a
+		// corrupted resume.
+		_ = removePartialFile(tmpFilePath)
+		_ = os.Remove(metaPath)
+	}
+
 	tmpFileInfo, err := os.Stat(tmpFilePath)
-	if err == nil && uri.LooksLikeHTTPURL() {
-		support, err := uri.checkSeverSupportsRangeHeader()
-		if err != nil {
-			return fmt.Errorf("failed to check if uri server supports range header: %v", err)
-		}
-		if support {
-			startPos := tmpFileInfo.Size()
-			req.Header.Set("Range", fmt.Sprintf("bytes=%d-", startPos))
-		} else {
-			err := removePartialFile(tmpFilePath)
-			if err != nil {
-				return err
-			}
+	if err == nil && probe.supportsRanges {
+		startPos := tmpFileInfo.Size()
+		req.Header.Set("Range", fmt.Sprintf("bytes=%d-", startPos))
+	} else if err == nil && uri.LooksLikeHTTPURL() {
+		// .partial exists but server doesn't support ranges — discard it.
+		if rerr := removePartialFile(tmpFilePath); rerr != nil {
+			return rerr
 		}
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("failed to check file %q existence: %v", filePath, err)
